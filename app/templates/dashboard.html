@@ -1,0 +1,519 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>LoadFlow — Dashboard</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="topbar">
+    <div class="brand">Load<span>Flow</span></div>
+    <div class="row">
+      <span class="userchip" id="userchip"></span>
+      <button class="secondary small" onclick="logout()">Logout</button>
+    </div>
+  </div>
+
+  <div class="container">
+    <div class="section-tabs" id="sectionTabs"></div>
+    <div id="content"></div>
+  </div>
+
+  <!-- generic modal -->
+  <div class="modal-bg" id="modalBg" onclick="if(event.target===this)closeModal()">
+    <div class="modal" id="modalBody"></div>
+  </div>
+
+<script>
+/* ============ core helpers ============ */
+const token = localStorage.getItem('token');
+if (!token) location.href = '/';
+let ME = null, PERMS = [], CATALOG = [];
+
+async function api(url, method = 'GET', body = null) {
+  const r = await fetch(url, {
+    method,
+    headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token },
+    body: body ? JSON.stringify(body) : null,
+  });
+  if (r.status === 401) { localStorage.removeItem('token'); location.href = '/'; return; }
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.detail || ('HTTP ' + r.status));
+  return j;
+}
+function esc(s) { return (s ?? '').toString().replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+function can(p) { return PERMS.includes(p); }
+function logout() { localStorage.removeItem('token'); fetch('/auth/logout', {method:'POST'}); location.href = '/'; }
+function toast(err) { alert(err.message || err); }
+function openModal(html) { document.getElementById('modalBody').innerHTML = html; document.getElementById('modalBg').classList.add('open'); }
+function closeModal() { document.getElementById('modalBg').classList.remove('open'); }
+function stateBadge(l) {
+  let html = `<span class="badge state">${esc(l.state.replaceAll('_',' '))}</span>`;
+  if (l.compliance_flagged && !l.compliance_overridden)
+    html += ` <span class="badge flag" title="${esc(l.compliance_reason||'')}">⚠ COMPLIANCE</span>`;
+  if (l.compliance_overridden)
+    html += ` <span class="badge override" title="${esc(l.compliance_reason||'')}">OVERRIDDEN</span>`;
+  if (l.pod_uploaded) html += ` <span class="badge ok">POD</span>`;
+  return html;
+}
+const NEXT_STATES = {
+  'POSTED': [], 'CARRIER_ASSIGNED': ['RATE_CONFIRMED'],
+  'RATE_CONFIRMED': ['DISPATCHED'], 'DISPATCHED': ['IN_TRANSIT'],
+  'IN_TRANSIT': ['DELIVERED'], 'DELIVERED': ['POD_VERIFIED'],
+  'POD_VERIFIED': ['CLOSED'], 'CLOSED': [],
+};
+
+/* ============ boot ============ */
+(async function init() {
+  try {
+    ME = await api('/auth/me');
+    PERMS = ME.permissions;
+    CATALOG = await api('/rbac/permissions');
+  } catch (e) { return; }
+  document.getElementById('userchip').innerHTML =
+    `<b>${esc(ME.full_name)}</b> · ${esc(ME.account_type)}${ME.organization_name ? ' @ ' + esc(ME.organization_name) : ''}${ME.is_org_admin ? ' · <span class="badge ok">ADMIN</span>' : ''}`;
+
+  const tabs = [];
+  if (ME.account_type === 'BROKER') {
+    tabs.push(['board', 'Load Board'], ['carriers', 'Carriers & Compliance']);
+  } else if (ME.account_type === 'CARRIER') {
+    tabs.push(['myloads', 'My Loads']);
+  } else {
+    tabs.push(['myshipments', 'My Shipments']);
+  }
+  if (ME.is_org_admin || can('staff.manage')) tabs.push(['admin', 'Staff & Roles']);
+
+  const tabBar = document.getElementById('sectionTabs');
+  tabBar.innerHTML = tabs.map(([id, label], i) =>
+    `<button id="tab-${id}" class="${i===0?'active':''}" onclick="show('${id}')">${label}</button>`).join('');
+  show(tabs[0][0]);
+})();
+
+function show(section) {
+  document.querySelectorAll('.section-tabs button').forEach(b => b.classList.remove('active'));
+  document.getElementById('tab-' + section).classList.add('active');
+  ({board: renderBoard, carriers: renderCarriers, myloads: renderCarrierLoads,
+    myshipments: renderShipper, admin: renderAdmin})[section]();
+}
+
+/* ============ BROKER: load board ============ */
+let boardFilters = { q: '', state: '', flagged: '' };
+async function renderBoard() {
+  const c = document.getElementById('content');
+  const params = new URLSearchParams();
+  if (boardFilters.q) params.set('q', boardFilters.q);
+  if (boardFilters.state) params.set('state', boardFilters.state);
+  if (boardFilters.flagged) params.set('flagged', boardFilters.flagged);
+  let loads = [];
+  try { loads = await api('/loads?' + params); } catch (e) { toast(e); }
+  const flaggedCount = loads.filter(l => l.compliance_flagged && !l.compliance_overridden).length;
+
+  c.innerHTML = `
+    <div class="card">
+      <div class="row" style="justify-content:space-between">
+        <h2>Load Board ${flaggedCount ? `<span class="badge flag">${flaggedCount} compliance alert${flaggedCount>1?'s':''}</span>` : ''}</h2>
+        ${can('load.create') ? '<button onclick="loadForm()">+ Post Load</button>' : ''}
+      </div>
+      <div class="row" style="margin:10px 0">
+        <input id="f-q" placeholder="Search origin/dest/ref/commodity" value="${esc(boardFilters.q)}" style="flex:1;min-width:200px">
+        <select id="f-state">
+          <option value="">All states</option>
+          ${Object.keys(NEXT_STATES).map(s => `<option ${boardFilters.state===s?'selected':''}>${s}</option>`).join('')}
+        </select>
+        <select id="f-flagged">
+          <option value="">Flagged?</option>
+          <option value="true" ${boardFilters.flagged==='true'?'selected':''}>Flagged only</option>
+          <option value="false" ${boardFilters.flagged==='false'?'selected':''}>Clean only</option>
+        </select>
+        <button class="secondary" onclick="applyFilters()">Filter</button>
+      </div>
+      <table>
+        <tr><th>Ref</th><th>Lane</th><th>Equip / Commodity</th><th>Shipper</th><th>Carrier</th><th>Status</th><th></th></tr>
+        ${loads.map(l => `<tr>
+          <td>${esc(l.reference)}</td>
+          <td>${esc(l.origin)} → ${esc(l.destination)}</td>
+          <td>${esc(l.equipment_type)}<br><span class="muted">${esc(l.commodity)}</span></td>
+          <td>${esc(l.shipper_name||'')}</td>
+          <td>${esc(l.carrier_org_name||'—')}</td>
+          <td>${stateBadge(l)}</td>
+          <td><button class="small secondary" onclick="loadDetail(${l.id})">Open</button></td>
+        </tr>`).join('') || '<tr><td colspan="7" class="muted">No loads found</td></tr>'}
+      </table>
+    </div>`;
+}
+function applyFilters() {
+  boardFilters = {
+    q: document.getElementById('f-q').value,
+    state: document.getElementById('f-state').value,
+    flagged: document.getElementById('f-flagged').value,
+  };
+  renderBoard();
+}
+function loadForm() {
+  openModal(`
+    <h3>Post New Load</h3>
+    <form onsubmit="return submitLoad(event)">
+      <input name="origin" placeholder="Origin (e.g. Chicago, IL)" required>
+      <input name="destination" placeholder="Destination" required>
+      <input name="equipment_type" placeholder="Equipment (e.g. Dry Van)" required>
+      <input name="commodity" placeholder="Commodity" required>
+      <input name="weight_lbs" type="number" placeholder="Weight (lbs)">
+      <input name="shipper_email" type="email" placeholder="Shipper account email" required value="shipper@demo.io">
+      <button type="submit">Post Load</button>
+    </form>`);
+}
+async function submitLoad(e) {
+  e.preventDefault();
+  const data = {}; new FormData(e.target).forEach((v,k) => data[k] = v);
+  if (data.weight_lbs) data.weight_lbs = parseInt(data.weight_lbs); else delete data.weight_lbs;
+  try { await api('/loads', 'POST', data); closeModal(); renderBoard(); } catch (err) { toast(err); }
+  return false;
+}
+
+/* ============ Load detail (shared by broker & carrier) ============ */
+async function loadDetail(id) {
+  let l, events, rates = [];
+  try {
+    l = await api('/loads/' + id);
+    events = await api(`/loads/${id}/events`);
+    rates = await api(`/loads/${id}/rate-confirmations`).catch(() => []);
+  } catch (e) { return toast(e); }
+
+  const actions = [];
+  if (ME.account_type === 'BROKER') {
+    if (l.state === 'POSTED' && can('load.assign_carrier'))
+      actions.push(`<button onclick="assignCarrierForm(${l.id})">Assign Carrier</button>`);
+    if (l.carrier_org_id && can('rate.confirm'))
+      actions.push(`<button class="secondary" onclick="rateForm(${l.id})">+ Rate Version</button>`);
+    if (l.compliance_flagged && !l.compliance_overridden && can('load.override_compliance_flag'))
+      actions.push(`<button class="danger" onclick="overrideForm(${l.id})">Override Compliance</button>`);
+  }
+  if (ME.account_type === 'CARRIER' && l.state === 'CARRIER_ASSIGNED') {
+    if (can('load.accept')) actions.push(`<button onclick="act('/loads/${l.id}/accept', ${l.id})">Accept</button>`);
+    if (can('load.decline')) actions.push(`<button class="danger" onclick="act('/loads/${l.id}/decline', ${l.id})">Decline</button>`);
+  }
+  (NEXT_STATES[l.state] || []).forEach(s => {
+    const needed = s === 'RATE_CONFIRMED' ? 'rate.confirm' : 'load.update_status';
+    if (can(needed))
+      actions.push(`<button class="secondary" onclick="transition(${l.id}, '${s}')">→ ${s.replaceAll('_',' ')}</button>`);
+  });
+  if (ME.account_type === 'CARRIER' && l.state === 'DELIVERED' && can('pod.upload'))
+    actions.push(`<button onclick="podForm(${l.id})">Upload POD</button>`);
+
+  openModal(`
+    <h3>${esc(l.reference)} — ${esc(l.origin)} → ${esc(l.destination)}</h3>
+    <p>${stateBadge(l)}</p>
+    ${l.compliance_flagged ? `<p class="msg error">⚠ ${esc(l.compliance_reason)}</p>` : ''}
+    <p class="muted">${esc(l.equipment_type)} · ${esc(l.commodity)} · ${l.weight_lbs ? l.weight_lbs + ' lbs' : ''}<br>
+      Shipper: ${esc(l.shipper_name||'')} · Carrier: ${esc(l.carrier_org_name||'unassigned')}</p>
+    <div class="row" style="margin:12px 0">${actions.join('') || '<span class="muted">No actions available to you</span>'}</div>
+    ${rates.length ? `<h3 style="margin-top:10px">Rate Confirmations</h3>
+      <table><tr><th>v</th><th>Base</th><th>Status</th><th></th></tr>
+      ${rates.map(r => `<tr><td>v${r.version}</td><td>$${r.base_rate.toFixed(2)}</td>
+        <td>${r.confirmed ? `<span class="badge ok">CONFIRMED${l.rate_confirmation_id===r.id?' · ACTIVE':''}</span>` : '<span class="badge warn">DRAFT</span>'}</td>
+        <td>${!r.confirmed && can('rate.confirm') ? `<button class="small" onclick="confirmRate(${l.id}, ${r.version})">Confirm</button>` : ''}</td>
+      </tr>`).join('')}</table>` : ''}
+    <h3 style="margin-top:14px">Audit Trail</h3>
+    <ul class="timeline">
+      ${events.map(e => `<li><b>${esc(e.event_type)}</b>
+        ${e.from_state ? esc(e.from_state) + ' → ' : ''}${esc(e.to_state||'')}
+        ${e.note ? '· ' + esc(e.note) : ''}
+        <div class="t">${new Date(e.created_at + 'Z').toLocaleString()} · by ${esc(e.actor_name||'?')}</div></li>`).join('')}
+    </ul>`);
+}
+async function act(url, id) {
+  try { await api(url, 'POST'); loadDetail(id); } catch (e) { toast(e); }
+}
+async function transition(id, to) {
+  try { await api(`/loads/${id}/transition`, 'POST', { to_state: to }); loadDetail(id); }
+  catch (e) { toast(e); }
+}
+async function assignCarrierForm(id) {
+  let carriers = [];
+  try { carriers = await api('/compliance/carriers'); } catch (e) { return toast(e); }
+  openModal(`
+    <h3>Assign Carrier</h3>
+    <form onsubmit="return submitAssign(event, ${id})">
+      <select name="carrier_org_id" required>
+        ${carriers.map(c => `<option value="${c.id}">
+          ${esc(c.name)}${c.insurance_expired ? ' ⚠ INSURANCE EXPIRED' : c.insurance_expiring_soon ? ' ⏳ expiring soon' : ''}
+        </option>`).join('')}
+      </select>
+      <p class="muted">Assigning a non-compliant carrier will auto-flag the load and block progression.</p>
+      <button type="submit">Assign</button>
+    </form>`);
+}
+async function submitAssign(e, id) {
+  e.preventDefault();
+  try {
+    await api(`/loads/${id}/assign-carrier`, 'POST',
+      { carrier_org_id: parseInt(new FormData(e.target).get('carrier_org_id')) });
+    loadDetail(id);
+  } catch (err) { toast(err); }
+  return false;
+}
+function rateForm(id) {
+  openModal(`
+    <h3>New Rate Confirmation Version</h3>
+    <form onsubmit="return submitRate(event, ${id})">
+      <input name="base_rate" type="number" step="0.01" placeholder="Base rate ($)" required>
+      <input name="acc_name" placeholder="Accessorial name (optional)">
+      <input name="acc_amount" type="number" step="0.01" placeholder="Accessorial amount">
+      <button type="submit">Create Version</button>
+      <p class="muted">Creates a new immutable version. Confirming a version pins it to the load permanently.</p>
+    </form>`);
+}
+async function submitRate(e, id) {
+  e.preventDefault();
+  const f = new FormData(e.target);
+  const acc = f.get('acc_name') ? [{ name: f.get('acc_name'), amount: parseFloat(f.get('acc_amount') || 0) }] : [];
+  try {
+    await api(`/loads/${id}/rate-confirmations`, 'POST',
+      { base_rate: parseFloat(f.get('base_rate')), accessorials: acc });
+    loadDetail(id);
+  } catch (err) { toast(err); }
+  return false;
+}
+async function confirmRate(id, version) {
+  try { await api(`/loads/${id}/rate-confirmations/${version}/confirm`, 'POST'); loadDetail(id); }
+  catch (e) { toast(e); }
+}
+function overrideForm(id) {
+  openModal(`
+    <h3>Override Compliance Flag</h3>
+    <form onsubmit="return submitOverride(event, ${id})">
+      <textarea name="note" rows="3" placeholder="Justification (required, goes to audit trail)" required></textarea>
+      <button type="submit" class="danger">Override</button>
+    </form>`);
+}
+async function submitOverride(e, id) {
+  e.preventDefault();
+  try {
+    await api(`/loads/${id}/override-compliance`, 'POST',
+      { note: new FormData(e.target).get('note') });
+    loadDetail(id);
+  } catch (err) { toast(err); }
+  return false;
+}
+function podForm(id) {
+  openModal(`
+    <h3>Upload POD</h3>
+    <form onsubmit="return submitPod(event, ${id})">
+      <input name="note" placeholder="POD reference / note (e.g. signed BOL #123)">
+      <button type="submit">Record POD</button>
+    </form>`);
+}
+async function submitPod(e, id) {
+  e.preventDefault();
+  try {
+    await api(`/loads/${id}/pod`, 'POST', { note: new FormData(e.target).get('note') });
+    loadDetail(id);
+  } catch (err) { toast(err); }
+  return false;
+}
+
+/* ============ BROKER: carriers & compliance ============ */
+async function renderCarriers() {
+  const c = document.getElementById('content');
+  let carriers = [];
+  try { carriers = await api('/compliance/carriers'); } catch (e) { toast(e); }
+  c.innerHTML = `
+    <div class="card">
+      <h2>Carrier Directory & Compliance</h2>
+      <table>
+        <tr><th>Carrier</th><th>Record</th><th>Insurance</th><th>Authority</th><th></th></tr>
+        ${carriers.map(x => `<tr>
+          <td>${esc(x.name)}</td>
+          <td>${x.has_compliance_record ? '<span class="badge ok">ON FILE</span>' : '<span class="badge warn">MISSING</span>'}</td>
+          <td>${x.insurance_expired ? '<span class="badge flag">EXPIRED</span>' : x.insurance_expiring_soon ? '<span class="badge warn">EXPIRING &lt;30d</span>' : x.has_compliance_record ? '<span class="badge ok">OK</span>' : '—'}</td>
+          <td>${esc(x.authority_status || '—')}</td>
+          <td><button class="small secondary" onclick="complianceForm(${x.id}, '${esc(x.name)}')">Edit Record</button></td>
+        </tr>`).join('')}
+      </table>
+    </div>`;
+}
+async function complianceForm(orgId, name) {
+  let rec = null;
+  try { rec = await api('/compliance/carriers/' + orgId); } catch (e) { /* none yet */ }
+  const expiry = rec?.insurance_expiry ? rec.insurance_expiry.slice(0, 10) : '';
+  openModal(`
+    <h3>Compliance Record — ${esc(name)}</h3>
+    <form onsubmit="return submitCompliance(event, ${orgId})">
+      <label class="muted">Insurance expiry</label>
+      <input name="insurance_expiry" type="date" value="${expiry}">
+      <input name="mc_number" placeholder="MC number" value="${esc(rec?.mc_number||'')}">
+      <input name="dot_number" placeholder="DOT number" value="${esc(rec?.dot_number||'')}">
+      <select name="authority_status">
+        ${['ACTIVE','SUSPENDED','REVOKED'].map(s => `<option ${rec?.authority_status===s?'selected':''}>${s}</option>`).join('')}
+      </select>
+      <input name="approved_equipment" placeholder="Approved equipment (comma-sep)" value="${esc(rec?.approved_equipment||'')}">
+      <input name="approved_commodities" placeholder="Approved commodities (comma-sep)" value="${esc(rec?.approved_commodities||'')}">
+      <button type="submit">Save</button>
+    </form>`);
+}
+async function submitCompliance(e, orgId) {
+  e.preventDefault();
+  const data = {}; new FormData(e.target).forEach((v,k) => data[k] = v);
+  if (data.insurance_expiry) data.insurance_expiry = data.insurance_expiry + 'T00:00:00Z';
+  else data.insurance_expiry = null;
+  try { await api('/compliance/carriers/' + orgId, 'PUT', data); closeModal(); renderCarriers(); }
+  catch (err) { toast(err); }
+  return false;
+}
+
+/* ============ CARRIER: my loads ============ */
+async function renderCarrierLoads() {
+  const c = document.getElementById('content');
+  let loads = [];
+  try { loads = await api('/loads'); } catch (e) { toast(e); }
+  c.innerHTML = `
+    <div class="card">
+      <h2>Loads Assigned to ${esc(ME.organization_name || 'us')}</h2>
+      <table>
+        <tr><th>Ref</th><th>Lane</th><th>Equip / Commodity</th><th>Status</th><th></th></tr>
+        ${loads.map(l => `<tr>
+          <td>${esc(l.reference)}</td>
+          <td>${esc(l.origin)} → ${esc(l.destination)}</td>
+          <td>${esc(l.equipment_type)}<br><span class="muted">${esc(l.commodity)}</span></td>
+          <td>${stateBadge(l)}</td>
+          <td><button class="small secondary" onclick="loadDetail(${l.id})">Open</button></td>
+        </tr>`).join('') || '<tr><td colspan="5" class="muted">No loads assigned to your organization</td></tr>'}
+      </table>
+    </div>`;
+}
+
+/* ============ SHIPPER: my shipments ============ */
+async function renderShipper() {
+  const c = document.getElementById('content');
+  let loads = [];
+  try { loads = await api('/loads'); } catch (e) { toast(e); }
+  c.innerHTML = `
+    <div class="card">
+      <h2>My Shipments</h2>
+      <table>
+        <tr><th>Ref</th><th>Lane</th><th>Status</th><th>Delivery</th></tr>
+        ${loads.map(l => `<tr>
+          <td>${esc(l.reference)}</td>
+          <td>${esc(l.origin)} → ${esc(l.destination)}</td>
+          <td><span class="badge state">${esc(l.state.replaceAll('_',' '))}</span></td>
+          <td>${['DELIVERED','POD_VERIFIED','CLOSED'].includes(l.state)
+              ? '<span class="badge ok">✓ Delivered' + (l.pod_uploaded ? ' · POD on file' : '') + '</span>'
+              : '<span class="muted">In progress</span>'}</td>
+        </tr>`).join('') || '<tr><td colspan="4" class="muted">No shipments yet</td></tr>'}
+      </table>
+      <p class="muted" style="margin-top:8px">Shippers see status and delivery confirmation only — internal broker/carrier data is not visible.</p>
+    </div>`;
+}
+
+/* ============ ADMIN: staff & roles (role builder UI) ============ */
+async function renderAdmin() {
+  const c = document.getElementById('content');
+  let roles = [], staff = [];
+  try {
+    roles = await api('/rbac/roles');
+    staff = await api('/rbac/staff');
+  } catch (e) { toast(e); }
+  c.innerHTML = `
+    <div class="grid2">
+      <div class="card">
+        <div class="row" style="justify-content:space-between">
+          <h2>Custom Roles</h2>
+          <button onclick="roleForm()">+ New Role</button>
+        </div>
+        <table>
+          <tr><th>Role</th><th>Permissions</th><th></th></tr>
+          ${roles.map(r => `<tr>
+            <td><b>${esc(r.name)}</b></td>
+            <td class="muted">${r.permission_codes.map(esc).join('<br>') || '—'}</td>
+            <td><button class="small secondary" onclick="editRoleForm(${r.id}, '${esc(r.name)}')">Edit</button></td>
+          </tr>`).join('') || '<tr><td colspan="3" class="muted">No roles yet — create one</td></tr>'}
+        </table>
+      </div>
+      <div class="card">
+        <div class="row" style="justify-content:space-between">
+          <h2>Staff</h2>
+          <button onclick="staffForm()">+ Invite Staff</button>
+        </div>
+        <table>
+          <tr><th>Name</th><th>Email</th><th>Roles</th></tr>
+          ${staff.map(s => `<tr>
+            <td>${esc(s.full_name)} ${s.is_org_admin ? '<span class="badge ok">ADMIN</span>' : ''}</td>
+            <td class="muted">${esc(s.email)}</td>
+            <td class="muted">${(s.roles||[]).map(esc).join(', ') || '—'}</td>
+          </tr>`).join('')}
+        </table>
+      </div>
+    </div>`;
+  window._roles = roles;
+}
+function permChecks(selected = []) {
+  return `<div class="checkgrid">${CATALOG.map(p =>
+    `<label><input type="checkbox" name="perm" value="${p.code}" ${selected.includes(p.code)?'checked':''}>
+     <span title="${esc(p.description)}">${p.code}</span></label>`).join('')}</div>`;
+}
+function roleForm() {
+  openModal(`
+    <h3>Create Role (from permission catalog)</h3>
+    <form onsubmit="return submitRole(event)">
+      <input name="name" placeholder="Role name (e.g. Dispatcher)" required>
+      ${permChecks()}
+      <button type="submit">Create Role</button>
+    </form>`);
+}
+async function submitRole(e) {
+  e.preventDefault();
+  const codes = [...e.target.querySelectorAll('input[name=perm]:checked')].map(x => x.value);
+  try {
+    await api('/rbac/roles', 'POST', { name: new FormData(e.target).get('name'), permission_codes: codes });
+    closeModal(); renderAdmin();
+  } catch (err) { toast(err); }
+  return false;
+}
+function editRoleForm(id, name) {
+  const role = (window._roles || []).find(r => r.id === id);
+  openModal(`
+    <h3>Edit Role — ${esc(name)}</h3>
+    <form onsubmit="return submitEditRole(event, ${id})">
+      ${permChecks(role?.permission_codes || [])}
+      <button type="submit">Save Permissions</button>
+    </form>`);
+}
+async function submitEditRole(e, id) {
+  e.preventDefault();
+  const codes = [...e.target.querySelectorAll('input[name=perm]:checked')].map(x => x.value);
+  try { await api(`/rbac/roles/${id}/permissions`, 'PUT', { permission_codes: codes }); closeModal(); renderAdmin(); }
+  catch (err) { toast(err); }
+  return false;
+}
+function staffForm() {
+  const roles = window._roles || [];
+  openModal(`
+    <h3>Invite Staff Member</h3>
+    <form onsubmit="return submitStaff(event)">
+      <input name="full_name" placeholder="Full name" required>
+      <input name="email" type="email" placeholder="Email" required>
+      <input name="password" type="password" placeholder="Temp password (min 6)" required>
+      <label class="muted">Assign roles:</label>
+      <div class="checkgrid">${roles.map(r =>
+        `<label><input type="checkbox" name="role" value="${r.id}"> ${esc(r.name)}</label>`).join('') || '<span class="muted">No roles yet</span>'}</div>
+      <button type="submit">Create Staff Account</button>
+      <p class="muted">Email invites skipped for hackathon scope — share the temp password directly.</p>
+    </form>`);
+}
+async function submitStaff(e) {
+  e.preventDefault();
+  const f = new FormData(e.target);
+  const roleIds = [...e.target.querySelectorAll('input[name=role]:checked')].map(x => parseInt(x.value));
+  try {
+    await api('/rbac/staff', 'POST', {
+      full_name: f.get('full_name'), email: f.get('email'),
+      password: f.get('password'), role_ids: roleIds,
+    });
+    closeModal(); renderAdmin();
+  } catch (err) { toast(err); }
+  return false;
+}
+</script>
+</body>
+</html>
